@@ -35,13 +35,26 @@
 # intra-op parallelism defaults to using every available core for a
 # SINGLE request's matrix ops -- with --cpu 2, one request already
 # monopolizes both cores, so a second concurrent request just contends
-# for the same threads instead of running in parallel. Confirmed
-# empirically: 1 request took 74s, 2 concurrent took 138s (should be
-# ~74s if truly parallel, ~148s if fully serial -- this was barely
-# better than serial). Pinning each request to 1 thread trades slower
-# single-request latency for genuine multi-request parallelism across
-# --cpu's cores. Not yet re-measured after this change -- confirm with
-# the same concurrent-vs-single comparison before trusting it.
+# for the same threads instead of running in parallel. Re-measured after
+# adding this: steady-state (warm instance) went from ~1-4s single ->
+# ~4.75s for 2 concurrent -- still not clean parallel scaling, but the
+# original "74s -> 138s" comparison that motivated this turned out to be
+# measuring torch's one-time cold-start init cost, not steady state (see
+# the corrected latency section in README.md). Left in place since it's
+# free and directionally correct, but it did not solve concurrent
+# contention on its own -- see OPENMED_SERVICE_BATCHING_ENABLED below for
+# the next thing tried.
+#
+# OPENMED_SERVICE_BATCHING_ENABLED: groups compatible concurrent requests
+# into one model forward pass instead of running each separately --
+# amortizes fixed per-call cost across concurrent requests on the same 2
+# CPUs, rather than trying to get them literal separate cores (which
+# OMP_NUM_THREADS=1 alone didn't achieve). openmed's docs describe this as
+# covering /analyze and /pii/extract specifically; not confirmed yet
+# whether /pii/deidentify (what this repo's smoke test and most examples
+# use) is included -- test both before assuming it helps the endpoint you
+# actually care about. BATCH_MAX_SIZE/BATCH_MAX_WAIT_MS values here match
+# .env.example's VM defaults, not independently tuned for this CPU count.
 #
 # Auth: the app itself enforces X-API-Key (manage.py), so this deploys
 # with --allow-unauthenticated to match the VM's auth model exactly. Add
@@ -174,6 +187,9 @@ cat > "$FLAGS_FILE" <<EOF
   TOKENIZERS_PARALLELISM: "false"
   OMP_NUM_THREADS: "1"
   MKL_NUM_THREADS: "1"
+  OPENMED_SERVICE_BATCHING_ENABLED: "true"
+  OPENMED_SERVICE_BATCH_MAX_SIZE: "32"
+  OPENMED_SERVICE_BATCH_MAX_WAIT_MS: "50"
 --set-secrets: OPENMED_API_KEY=openmed-api-key:latest
 EOF
 

@@ -215,21 +215,64 @@ for steady state. Practical implications, corrected:
   a cold start (`scripts/smoke_test.sh` uses 180s for exactly this
   reason) — but budget single-digit seconds for every request after that,
   not 40+.
-- Concurrency still doesn't scale cleanly: 2 concurrent requests (4.75s)
-  took meaningfully longer than 1 (1-4s), even after pinning `torch` to
-  1 thread per request (`OMP_NUM_THREADS=1`/`MKL_NUM_THREADS=1`, tried
-  specifically to let concurrent requests use separate cores) — with a
-  single Uvicorn worker sharing `--cpu 2`, concurrent CPU-bound requests
-  still contend rather than truly parallelize. `--concurrency 256` with
-  `--max-instances 1` (this repo's current defaults) queues requests onto
-  the one instance rather than running them in parallel. Not
-  systematically load-tested past 2 concurrent requests; confirm with
+- `OMP_NUM_THREADS=1`/`MKL_NUM_THREADS=1` alone (pinning `torch` to 1
+  thread per request, to stop one request monopolizing both cores) did
+  **not** fix concurrent scaling on its own: 2 concurrent requests still
+  took ~4.75s against a ~1-4s single-request baseline.
+
+**What actually fixed concurrent scaling: `OPENMED_SERVICE_BATCHING_ENABLED=true`.**
+Enabling openmed's dynamic request batching (groups concurrent requests
+into one forward pass instead of running each separately) measurably
+changed the picture, tested on both endpoints since openmed's docs only
+explicitly list `/analyze` and `/pii/extract` as covered, not
+`/pii/deidentify`:
+
+| | Single (warm) | Concurrent | Ratio |
+|---|---|---|---|
+| `/pii/extract`, 2 concurrent | 2.44s | 3.41s | 1.4x for 2x load |
+| `/pii/deidentify`, 2 concurrent | 1.27-1.91s | 1.48s | ~flat |
+| `/pii/deidentify`, 4 concurrent | 1.91s | 5.47s | 2.9x for 4x load |
+
+Batching helps `/pii/deidentify` too, despite not being explicitly listed
+in openmed's docs as covered — worth relying on this deployment's own
+measurement over the docs' stated scope, not assuming either way without
+testing. Real improvement over the pre-batching ~2x-for-2x (no effective
+parallelism) — but scaling isn't flat past 2 concurrent requests (4
+concurrent shows real contention returning), so this raises the ceiling,
+it doesn't remove it. `OPENMED_SERVICE_BATCH_MAX_SIZE`/`_MAX_WAIT_MS` are
+currently the `.env.example` VM defaults (32 / 50ms), not independently
+tuned for this CPU count — untested whether different values do better
+here.
+- Not systematically load-tested past 4 concurrent requests; confirm with
   `client/benchmark_rest.py --concurrency-levels ...` against the deployed
   URL before assuming a given concurrency level holds up.
-- If real traffic needs genuine concurrent throughput, look at Cloud
-  Run's GPU support (`--gpu`), more `--cpu`, or running multiple instances
-  (raise `--max-instances`) before assuming a single CPU-only instance
-  will parallelize CPU-bound inference on its own.
+- If real traffic needs more concurrent throughput than this, look at
+  Cloud Run's GPU support (`--gpu`), more `--cpu`, or running multiple
+  instances (raise `--max-instances`) next.
+
+**The batching win above does not hold at realistic document sizes --
+confirmed by an actual crash, not a guess.** All prior concurrency
+measurements used one-sentence test strings. Repeating the test with a
+real ~6.8KB clinical document (dense, realistic PHI content) at 10
+concurrent requests: Cloud Run logs showed genuinely overlapping/nested
+model-forward-pass progress bars (proof batching really was combining
+them into one pass), immediately followed by `Killed` (OOM) and Cloud
+Run's autoscaler spinning up a replacement instance. Batching's memory
+cost scales with `batch_size × document_length` — the same mechanism
+that helped short test sentences overloads `--memory 4Gi` once documents
+are realistically sized and concurrency is high. The service
+self-recovered (Cloud Run autoscaling), but any in-flight requests in
+that batch were dropped.
+
+Practical takeaway: **don't trust concurrency numbers measured with toy
+input sizes for a service that will see real documents.** Before
+relying on `OPENMED_SERVICE_BATCHING_ENABLED` in production here:
+lower `OPENMED_SERVICE_BATCH_MAX_SIZE` (currently 32, untuned), test
+concurrency with documents matching your actual expected size (not
+one-line examples), and/or raise `--memory` to give the batched forward
+pass more headroom. None of that has been done yet — this deployment's
+current config can OOM-crash under realistic concurrent load with real
+documents.
 
 Lesson embedded in this correction, not just the numbers: **always warm
 up before measuring latency that matters for a decision** — the original
