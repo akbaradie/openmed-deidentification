@@ -1,0 +1,47 @@
+name: Deploy to Cloud Run
+
+# Requires scripts/setup_gcp.sh to have been run once by hand first --
+# this workflow only builds + deploys, it doesn't provision infra.
+#
+# Auth is keyless: GitHub's OIDC token is exchanged for short-lived GCP
+# credentials via Workload Identity Federation, scoped to this exact repo
+# (see scripts/setup_gcp.sh). No service account key is stored in GitHub.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-cloud-run
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      REGION: ${{ vars.GCP_REGION }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.DEPLOYER_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Build and deploy
+        run: bash scripts/deploy_cloud_run.sh
+
+      - name: Smoke test
+        env:
+          OPENMED_API_KEY: ${{ secrets.OPENMED_SMOKE_TEST_API_KEY }}
+        run: |
+          URL=$(gcloud run services describe openmed-deidentification --project "$PROJECT_ID" --region "$REGION" --format='value(status.url)')
+          bash scripts/smoke_test.sh "$URL"
