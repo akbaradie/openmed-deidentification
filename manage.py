@@ -16,6 +16,7 @@ from __future__ import annotations
 import hmac
 import os
 
+from fastapi.openapi.utils import get_openapi
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -51,3 +52,34 @@ class ApiKeyMiddleware(BaseHTTPMiddleware):
 
 
 app.add_middleware(ApiKeyMiddleware)
+
+
+def _openapi_with_api_key_auth() -> dict:
+    """Declare X-API-Key as a security scheme purely so Swagger UI shows an
+    Authorize button. Enforcement is still the middleware above -- FastAPI
+    never validates this itself, since these routes have no `Depends()` on
+    it. This just lets you authorize once in /docs and have every
+    "Try it out" call carry the header automatically, instead of having no
+    field to enter it in at all.
+    """
+    if app.openapi_schema:
+        return app.openapi_schema
+
+    schema = get_openapi(title=app.title, version=app.version, description=app.description, routes=app.routes)
+    schema.setdefault("components", {}).setdefault("securitySchemes", {})["ApiKeyAuth"] = {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-API-Key",
+    }
+    for path, operations in schema.get("paths", {}).items():
+        if path in _UNAUTHENTICATED_PATHS:
+            continue
+        for operation in operations.values():
+            if isinstance(operation, dict):
+                operation.setdefault("security", []).append({"ApiKeyAuth": []})
+
+    app.openapi_schema = schema
+    return app.openapi_schema
+
+
+app.openapi = _openapi_with_api_key_auth

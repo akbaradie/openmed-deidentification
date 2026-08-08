@@ -2,32 +2,52 @@
 # Build and deploy the openmed-deidentification image to Cloud Run.
 #
 # Assumes scripts/setup_gcp.sh has already been run once (Artifact
-# Registry repo, HF cache bucket, and the openmed-api-key secret must
-# already exist). This script itself has no long-lived credentials or
-# secrets in it -- safe to call from a human's shell or from CI
-# (.github/workflows/deploy.yml calls this directly after WIF auth).
+# Registry repo and both secrets must already exist). This script itself
+# has no long-lived credentials or secrets in it -- safe to call from a
+# human's shell or from CI (.github/workflows/deploy.yml calls this
+# directly after WIF auth).
 #
-# Model caching on Cloud Run: instances are ephemeral, so a plain local
-# HF_HOME cache is wiped on every new instance/cold start. To get "download
-# once, reuse after" on Cloud Run specifically, this mounts the bucket
-# scripts/setup_gcp.sh created at HF_HOME via Cloud Run's native GCS FUSE
-# volume mount -- the first cold start downloads the model into the
-# bucket, every instance after (including new revisions) reads from it
-# instead of Hugging Face. FUSE-backed reads are slower than local disk,
-# but far faster than re-downloading multiple GB from HF on every cold
-# start.
+# Model caching: the model is baked into the image at build time (see
+# docker/Dockerfile + cloudbuild.yaml) rather than mounted from GCS at
+# runtime -- no FUSE mount, no network read on cold start, just a local
+# file already sitting in the image. HF_TOKEN only matters at *build*
+# time now (cloudbuild.yaml pulls it from Secret Manager to avoid
+# anonymous HF API rate limits during the bake-in download); this script
+# no longer needs a GCS bucket or volume mount for it at all.
+#
+# HF_HUB_OFFLINE=1: without this, huggingface_hub still pings the Hub API
+# at startup to check the local cache is fresh -- observed as an
+# unauthenticated-request warning in Cloud Run logs even with the model
+# fully baked in and OPENMED_SKIP_MODEL_VERIFY=1 set. That's a live network
+# dependency (and rate-limit risk) cold start shouldn't have once the
+# model's already on local disk, so this forces fully offline/local-only
+# lookups at runtime. Must NOT be set during the build step -- the
+# snapshot_download in docker/Dockerfile needs the network.
 #
 # Auth: the app itself enforces X-API-Key (manage.py), so this deploys
 # with --allow-unauthenticated to match the VM's auth model exactly. Add
 # --no-allow-unauthenticated afterward if you also want Cloud Run IAM as a
 # second layer.
 #
-# HF_TOKEN: openmed verifies the model's checksums via the HF Hub API
-# before downloading it. Anonymous (unauthenticated) HF API calls share a
-# much stricter rate limit than authenticated ones -- Cloud Run's shared
-# IP pool can hit that limit even for a single deploy, so this is required
-# in practice, not just for gated/private models. Stored in Secret Manager
-# as openmed-hf-token, same pattern as OPENMED_API_KEY (see setup_gcp.sh).
+# --cpu-throttling (request-based CPU, Cloud Run's default) instead of
+# --no-cpu-throttling: CPU is only allocated while a request is actively
+# being processed, not continuously. Switched deliberately from an earlier
+# always-allocated setup. openmed's warm-pool idle-unload timers rely on
+# background CPU time between requests to run promptly, which throttling
+# can delay -- but with MAX_INSTANCES=1 and only one model ever preloaded
+# (OPENMED_SERVICE_MAX_RESIDENT_MODELS=1), there's no second model
+# competing for warm-pool slots, so nothing should actually trigger
+# eviction regardless of timer timing. Revisit if a second model is ever
+# added to this deployment. Cheaper this way -- no idle CPU billing.
+#
+# CONCURRENCY=256 with MAX_INSTANCES=1: this raises how many in-flight
+# requests Cloud Run will queue onto the single instance, not how many run
+# truly in parallel -- inference is CPU-bound and this is 2 vCPUs, so
+# requests beyond what 2 CPUs can actually work on will queue and see
+# worse tail latency under real concurrent load, not genuine 256-way
+# parallelism. Worth confirming with `client/benchmark_rest.py
+# --concurrency-levels ...` against this exact deployment before assuming
+# it holds up under load.
 #
 # OPENMED_SKIP_MODEL_VERIFY: openmed 2.0.0's bundled manifest pins an
 # expected checksum per model that is NOT a hash of the model weights --
@@ -59,15 +79,15 @@ set -euo pipefail
 : "${REGION:=us-central1}"
 : "${SERVICE_NAME:=openmed-deidentification}"
 : "${REPO_NAME:=openmed}"
-: "${BUCKET_NAME:=${PROJECT_ID}-openmed-hf-cache}"
 : "${MODEL:=OpenMed/privacy-filter-multilingual-v2}"
 : "${MEMORY:=4Gi}"
 : "${CPU:=2}"
-: "${CONCURRENCY:=8}"
+: "${CONCURRENCY:=256}"
 : "${MIN_INSTANCES:=0}"
-: "${MAX_INSTANCES:=5}"
+: "${MAX_INSTANCES:=1}"
 
 IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO_NAME}/${SERVICE_NAME}:$(git rev-parse --short HEAD 2>/dev/null || date +%s)"
+CACHE_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO_NAME}/${SERVICE_NAME}:buildcache"
 
 # openmed defaults OPENMED_SERVICE_TRUSTED_HOSTS to localhost/127.0.0.1 --
 # Starlette's TrustedHostMiddleware 400s any request whose Host header
@@ -84,7 +104,7 @@ echo ">> Building and pushing image via Cloud Build ($IMAGE)..."
 # Not `gcloud builds submit --tag` -- that shortcut only looks for a
 # Dockerfile at the build context root, and ours is at docker/Dockerfile.
 # cloudbuild.yaml spells out the -f path explicitly instead.
-gcloud builds submit --project "$PROJECT_ID" --config cloudbuild.yaml --substitutions="_IMAGE=${IMAGE}" .
+gcloud builds submit --project "$PROJECT_ID" --config cloudbuild.yaml --substitutions="_IMAGE=${IMAGE},_CACHE_IMAGE=${CACHE_IMAGE}" .
 
 echo ">> Deploying to Cloud Run..."
 # Flags go through a --flags-file (YAML) instead of argv. Not just style --
@@ -110,22 +130,18 @@ cat > "$FLAGS_FILE" <<EOF
 --concurrency: ${CONCURRENCY}
 --min-instances: ${MIN_INSTANCES}
 --max-instances: ${MAX_INSTANCES}
---no-cpu-throttling:
---add-volume:
-  name: hf-cache
-  type: cloud-storage
-  bucket: ${BUCKET_NAME}
---add-volume-mount:
-  volume: hf-cache
-  mount-path: /data/hf-cache
+--cpu-throttling:
+--cpu-boost:
+--clear-volumes:
+--clear-volume-mounts:
 --set-env-vars:
   OPENMED_PROFILE: prod
   OPENMED_SERVICE_PRELOAD_MODELS: "${MODEL}"
   OPENMED_SERVICE_MAX_RESIDENT_MODELS: "1"
-  HF_HOME: /data/hf-cache
   OPENMED_SKIP_MODEL_VERIFY: "1"
   OPENMED_SERVICE_TRUSTED_HOSTS: "${TRUSTED_HOSTS}"
---set-secrets: OPENMED_API_KEY=openmed-api-key:latest,HF_TOKEN=openmed-hf-token:latest
+  HF_HUB_OFFLINE: "1"
+--set-secrets: OPENMED_API_KEY=openmed-api-key:latest
 EOF
 
 gcloud run deploy "$SERVICE_NAME" --flags-file="$FLAGS_FILE"

@@ -26,12 +26,12 @@ Plus batch clients and throughput benchmarks for processing many documents.
 
 ```
 manage.py                openmed.service.app + the X-API-Key check -- this is what actually runs
-docker/Dockerfile           image: non-root, single worker, $PORT-aware, healthcheck
+docker/Dockerfile           image: model baked in at build time, uv + CPU-only torch, non-root, single worker, $PORT-aware, healthcheck
 docker/Caddyfile             VM-only: TLS termination + proxy (no auth logic -- app owns that)
 docker-compose.yml            openmed + Caddy, named volume for the HF cache (VM target)
-scripts/setup_gcp.sh           one-time: Artifact Registry, HF cache bucket, secret, WIF trust for CI
-scripts/deploy_cloud_run.sh   build + deploy to Cloud Run, GCS-FUSE-mounted HF cache (Cloud Run target)
-cloudbuild.yaml                Cloud Build step pointing at docker/Dockerfile (used by deploy_cloud_run.sh)
+scripts/setup_gcp.sh           one-time: Artifact Registry, secrets, IAM, WIF trust for CI
+scripts/deploy_cloud_run.sh   build (model baked in, cached) + deploy to Cloud Run
+cloudbuild.yaml                buildx build w/ registry layer cache, BuildKit secret for HF_TOKEN
 .github/workflows/deploy.yml   CI/CD: deploy to Cloud Run on push to main, via Workload Identity Federation
 .env.example                  copy to .env and fill in
 scripts/run_local.sh          run manage.py directly on the host (no Docker)
@@ -43,6 +43,7 @@ client/benchmark_local.py       naive loop vs BatchProcessor, sweeps batch_size
 client/benchmark_rest.py        sequential vs concurrent REST calls, sweeps concurrency
 client/benchmark_common.py      shared synth-data / CSV / chart helpers
 examples/sample_input.jsonl     sample batch input
+notebooks/explore_endpoint.ipynb  interactive exploration of a deployed endpoint (health, deidentify, extract, small batch)
 ```
 
 `scripts/run_colab.sh` is the one exception that talks to
@@ -97,54 +98,108 @@ export PROJECT_ID=your-gcp-project
 bash scripts/deploy_cloud_run.sh
 ```
 
-What `setup_gcp.sh` does once: creates the Artifact Registry repo, the GCS
-bucket mounted at `HF_HOME` (`/data/hf-cache`) via Cloud Run's native GCS
-FUSE volume mount so the model downloads once on the first cold start and
-every instance after — including new revisions — reads the cached weights
-instead of hitting Hugging Face again, stores `OPENMED_API_KEY` and
-`HF_TOKEN` in Secret Manager, and sets up a Workload Identity Federation
-trust so GitHub Actions can deploy without a stored key (see CI/CD below).
+**The model is baked into the image, not mounted from GCS.**
+`docker/Dockerfile` downloads `OpenMed/privacy-filter-multilingual-v2`
+(~2.8GB) during `docker build` via `huggingface_hub.snapshot_download`,
+straight into `HF_HOME`. At runtime there's no FUSE mount, no network read
+— just a local file already sitting in the image, and
+`HF_HUB_OFFLINE=1` (set by `deploy_cloud_run.sh`) stops `huggingface_hub`
+from even pinging the Hub API to check freshness. Confirmed in practice:
+without it, cold start logged an unauthenticated Hub API call anyway
+despite the model already being local — easy to miss, since it doesn't
+fail until that shared-IP rate limit trips. Worth being precise about the
+actual payoff here: this change eliminates the GCS mount and that
+runtime Hub API call (a real reliability/rate-limit win), but **measured
+cold-start time was unchanged** by this step alone — see the table further
+down for what actually moved that number.
 
-Why `HF_TOKEN` is required in practice, not just for gated models: openmed
-verifies the model's checksum via the Hugging Face Hub API before
-downloading it, and anonymous (unauthenticated) HF API calls share a much
-stricter rate limit than authenticated ones — Cloud Run's shared IP pool
-can trip that limit on a single deploy.
+The obvious tradeoff: every build downloads that ~2.8GB too, not just the
+first cold start. `cloudbuild.yaml` addresses that with `buildx` +
+registry-backed layer caching (`--cache-from`/`--cache-to` against a
+`:buildcache` tag) — a build that doesn't touch `requirements.txt` or the
+download step reuses that layer entirely. Measured effect: a deploy that
+only changed an env var went from **8m39s → 21s**. A build cache miss
+(e.g. bumping the model version) still pays the full download.
 
-What `deploy_cloud_run.sh` does every time: builds the image via Cloud
-Build (using `cloudbuild.yaml`, since `docker/Dockerfile` isn't at the
-build context root), pushes to Artifact Registry, and deploys with
-`--no-cpu-throttling` (CPU stays allocated between requests, needed for the
-warm model pool and its idle-unload timers to behave correctly) and
+What `setup_gcp.sh` does once: creates the Artifact Registry repo (also
+holds the `:buildcache` tag), stores `OPENMED_API_KEY` (runtime) and
+`HF_TOKEN` (build-time only now — pulled into the build via a BuildKit
+secret, per `RUN --mount=type=secret` in the Dockerfile, so it never lands
+in an image layer) in Secret Manager, grants whichever service account
+Cloud Build actually executes as access to both (this varies by
+project — granted to both plausible candidates rather than guessing), and
+sets up Workload Identity Federation so GitHub Actions can deploy without
+a stored key (see CI/CD below).
+
+What `deploy_cloud_run.sh` does every time: builds via `cloudbuild.yaml`
+(buildx, not a plain `docker build` — needed for the registry cache and
+the BuildKit secret mount), pushes to Artifact Registry, and deploys with
+`--cpu-throttling` (Cloud Run's default — CPU only allocated while
+actively processing a request, cheaper than always-allocated; see the
+comment block in the script for why this is safe with a single preloaded
+model and `--max-instances 1`), `--cpu-boost` (extra CPU during the
+startup phase specifically — part of what got cold start from 41.7s to
+31.6s, see the latency section below), `--concurrency 256`
+`--max-instances 1` (queues concurrent requests onto one instance rather
+than scaling out — see the throughput caveat below),
 `--allow-unauthenticated` (Cloud Run's own IAM gate is off; the app-level
-`X-API-Key` check is what protects it, same as the VM). It also sets
-`OPENMED_SKIP_MODEL_VERIFY=1` — see the comment block at the top of the
-script for why: `openmed 2.0.0`'s bundled integrity check hashes the HF
-repo's *commit metadata*, not the model weights, so it false-positives on
-any trivial commit (confirmed for this exact model: the weights haven't
+`X-API-Key` check is what protects it, same as the VM), and
+`--clear-volumes --clear-volume-mounts` (belt-and-suspenders now that
+nothing's mounted — `gcloud run deploy` otherwise carries forward
+unspecified resource/volume settings from the live revision, the same
+mechanism that required an explicit `--gpu: "0"` after a GPU was once
+attached via the console; see the comment block in the script). It also
+sets `OPENMED_SKIP_MODEL_VERIFY=1` — see the comment block at the top of
+the script for why: `openmed 2.0.0`'s bundled integrity check hashes the
+HF repo's *commit metadata*, not the model weights, so it false-positives
+on any trivial commit (confirmed for this exact model: the weights haven't
 changed since upload, only a README got edited after the package's
 manifest was frozen). Revisit this once openmed ships a fix.
 
-Cold starts still happen whenever an instance scales up from zero — this
-avoids re-downloading the model on each one, not the in-memory load into the
-process itself. If you need zero cold starts entirely, set
-`MIN_INSTANCES=1` before running `deploy_cloud_run.sh` (an always-on
-instance costs more but skips scale-from-zero altogether).
+Cold starts still happen whenever an instance scales up from zero. If you
+need zero cold starts entirely, set `MIN_INSTANCES=1` before running
+`deploy_cloud_run.sh` (an always-on instance costs more but skips
+scale-from-zero altogether) — deliberately left at the default `0` here to
+stay cost-conscious, in the same spirit as `--cpu-throttling` below.
 
-**Inference latency is real and CPU-bound.** A single short-text
-`/pii/deidentify` request took ~44 seconds end-to-end on the default
-`--cpu 2 --memory 4Gi` config in testing — this is a 1.4B-parameter MoE
-model running on CPU only, not a hung request. Practical implications:
+**What actually moved the cold-start number, measured, not assumed:**
+
+| Change | Instance start → app ready |
+|---|---|
+| GCS-mounted model | 41.71s |
+| Baked into image (CUDA `torch`, no other changes) | 41.71s — **no improvement** |
+| Baked in + CPU-only `torch` (`uv`, `UV_TORCH_BACKEND=cpu`) + `--cpu-boost` | **31.62s** |
+
+The first row-to-row comparison is important: baking the model in and
+removing the GCS FUSE mount made *no measurable difference* — the mount
+itself only took ~0.5s, and the ~25s dominant cost in every case is
+Python/`torch`/`transformers` import time, unrelated to where the model
+file lives. What actually helped was the CPU-only `torch` wheel (this
+deployment has no GPU, so the default CUDA-enabled wheel was spending
+import time loading NVIDIA shared libraries it would never use) plus
+Cloud Run's `--cpu-boost` (extra CPU specifically during the startup
+phase). ~24% faster, real and reproducible — but don't assume the next
+plausible-sounding optimization helps without measuring it the same way
+(`gcloud logging read` on `resource.labels.revision_name`, diff
+"Starting new instance" against "Application startup complete").
+
+**Inference latency is real and CPU-bound, separately from cold start.**
+A single short-text `/pii/deidentify` request took ~44 seconds end-to-end
+on `--cpu 2 --memory 4Gi` — this is a 1.4B-parameter MoE model running on
+CPU only, not a hung request. Practical implications:
 - Client timeouts need real headroom — 60s (this repo's original default)
   isn't enough; `scripts/smoke_test.sh` now uses 180s.
-- Per-instance throughput is low (`--concurrency 8` doesn't help much if
-  each request occupies CPU for ~40s) — expect roughly one request at a
-  time in practice per instance, closer to 1 req/40s than 8 concurrent.
+- `--concurrency 256` with `--max-instances 1` (this repo's current
+  defaults) raises how many requests Cloud Run will *queue* onto the one
+  instance, not how many run truly in parallel — 2 vCPUs doing ~40s of
+  CPU-bound work per request means real throughput is closer to one
+  request at a time, and anything beyond that queues with worse tail
+  latency. Not yet load-tested against these exact settings; confirm with
+  `client/benchmark_rest.py --concurrency-levels ...` against the deployed
+  URL before assuming it holds up.
 - If real traffic needs better latency/throughput than this, look at
   Cloud Run's GPU support (`--gpu`) or a smaller/quantized model before
-  scaling horizontally with more CPU-only instances — this wasn't
-  benchmarked here, just flagging it as the next thing to measure with
-  `client/benchmark_rest.py` against the deployed URL.
+  scaling horizontally with more CPU-only instances.
 
 `gcloud` flag names shift over time — this was written against the CLI's
 current behavior but hasn't been run end-to-end in this session; sanity

@@ -6,13 +6,18 @@
 # or from CI) assumes everything here already exists.
 #
 # Creates:
-#   - Artifact Registry repo for the built image
-#   - GCS bucket mounted at HF_HOME on Cloud Run (see deploy_cloud_run.sh)
-#   - Secret Manager secrets holding OPENMED_API_KEY and HF_TOKEN (the
-#     latter is required in practice, not just for gated models -- openmed
-#     verifies checksums via the HF Hub API before downloading, and
-#     anonymous API calls hit a much stricter rate limit that Cloud Run's
-#     shared IP pool can trip on a single deploy)
+#   - Artifact Registry repo for the built image (also holds the
+#     :buildcache tag used for cross-build layer caching, see
+#     cloudbuild.yaml)
+#   - Secret Manager secrets holding OPENMED_API_KEY (used at runtime) and
+#     HF_TOKEN (used at *build* time -- the model is baked into the image
+#     via docker/Dockerfile, downloaded during `docker build`; anonymous
+#     HF API calls hit a much stricter rate limit than authenticated ones,
+#     enough to fail a build from a shared Cloud Build IP)
+#   - IAM grants for whichever service account Cloud Build actually
+#     executes as (this varies by project age/config -- granted to both
+#     plausible candidates rather than guessing) to read HF_TOKEN and push
+#     to Artifact Registry
 #   - If SETUP_WIF=true (default): a dedicated deployer service account +
 #     a Workload Identity Pool/OIDC provider trusting GitHub Actions,
 #     scoped to one specific "owner/repo" -- for the .github/workflows/
@@ -28,7 +33,6 @@ set -euo pipefail
 : "${PROJECT_ID:?Set PROJECT_ID (gcloud config get-value project)}"
 : "${REGION:=us-central1}"
 : "${REPO_NAME:=openmed}"
-: "${BUCKET_NAME:=${PROJECT_ID}-openmed-hf-cache}"
 : "${OPENMED_API_KEY:?Set OPENMED_API_KEY -- stored in Secret Manager, never in GitHub}"
 : "${HF_TOKEN:?Set HF_TOKEN -- a free read-scoped token from https://huggingface.co/settings/tokens, stored in Secret Manager}"
 : "${SETUP_WIF:=true}"
@@ -54,10 +58,6 @@ echo ">> Ensuring Artifact Registry repo exists..."
 gcloud artifacts repositories describe "$REPO_NAME" --location="$REGION" --project="$PROJECT_ID" >/dev/null 2>&1 || \
   gcloud artifacts repositories create "$REPO_NAME" --repository-format=docker --location="$REGION" --project="$PROJECT_ID"
 
-echo ">> Ensuring HF cache bucket exists..."
-gcloud storage buckets describe "gs://${BUCKET_NAME}" >/dev/null 2>&1 || \
-  gcloud storage buckets create "gs://${BUCKET_NAME}" --location="$REGION" --uniform-bucket-level-access --project="$PROJECT_ID"
-
 echo ">> Storing OPENMED_API_KEY and HF_TOKEN in Secret Manager..."
 if gcloud secrets describe openmed-api-key --project="$PROJECT_ID" >/dev/null 2>&1; then
   printf '%s' "$OPENMED_API_KEY" | gcloud secrets versions add openmed-api-key --project="$PROJECT_ID" --data-file=-
@@ -76,7 +76,8 @@ fi
 # read these secrets via --set-secrets. Defaults to the project's default
 # compute service account unless deploy_cloud_run.sh is changed to pass
 # --service-account with a dedicated runtime identity.
-: "${RUNTIME_SA:=$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')-compute@developer.gserviceaccount.com}"
+PROJECT_NUMBER="$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')"
+: "${RUNTIME_SA:=${PROJECT_NUMBER}-compute@developer.gserviceaccount.com}"
 echo ">> Granting the Cloud Run runtime service account (${RUNTIME_SA}) access to both secrets..."
 for SECRET_NAME in openmed-api-key openmed-hf-token; do
   gcloud secrets add-iam-policy-binding "$SECRET_NAME" \
@@ -86,12 +87,32 @@ for SECRET_NAME in openmed-api-key openmed-hf-token; do
     >/dev/null
 done
 
+# Cloud Build executes the actual `docker buildx build` as one of two
+# possible service accounts depending on project age/config -- the legacy
+# Cloud Build SA, or (newer default) the compute default SA (same as
+# RUNTIME_SA above). Granting both rather than guessing which one applies
+# here; an unused grant on the other is harmless.
+CLOUDBUILD_LEGACY_SA="${PROJECT_NUMBER}@cloudbuild.gserviceaccount.com"
+echo ">> Granting Cloud Build execution identities access to HF_TOKEN and Artifact Registry..."
+for SA in "$RUNTIME_SA" "$CLOUDBUILD_LEGACY_SA"; do
+  gcloud secrets add-iam-policy-binding openmed-hf-token \
+    --project="$PROJECT_ID" \
+    --member="serviceAccount:${SA}" \
+    --role="roles/secretmanager.secretAccessor" \
+    >/dev/null
+  gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+    --member="serviceAccount:${SA}" \
+    --role="roles/artifactregistry.writer" \
+    --condition=None \
+    >/dev/null
+done
+
 if [ "$SETUP_WIF" != "true" ]; then
   cat <<EOF
 
 >> Done (SETUP_WIF=false -- skipped the deployer service account and
-   Workload Identity Federation setup). Artifact Registry repo, HF cache
-   bucket, and the openmed-api-key secret are ready.
+   Workload Identity Federation setup). Artifact Registry repo and both
+   secrets are ready.
 
    If you're using Cloud Run's "Deploy continuously" / Developer Connect
    integration, finish that in the Cloud Run console -- it handles its own

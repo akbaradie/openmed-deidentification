@@ -1,13 +1,25 @@
+# syntax=docker/dockerfile:1
+# ^ required for the RUN --mount=type=secret step below (BuildKit only)
+
+FROM ghcr.io/astral-sh/uv:latest AS uv
+
 FROM python:3.11-slim AS base
 
-# Model cache lives at HF_HOME, meant to be a mounted volume (docker-compose
-# named volume on a VM; a Cloud Storage FUSE volume mount on Cloud Run --
-# see scripts/deploy_cloud_run.sh) so the model downloads once on first
-# boot and every restart/cold start after that reuses the cached weights
-# instead of re-fetching from Hugging Face.
+# Model lives baked into the image at HF_HOME, not on a mounted volume --
+# avoids the GCS FUSE mount + network read on every Cloud Run cold start.
+# The tradeoff: every image build downloads it too, unless the layer below
+# is served from cache (see cloudbuild.yaml's buildx registry cache).
+#
+# Cold-start measurement (see conversation/commit history) showed the
+# ~25s Python/torch/transformers import phase dominates cold start, not
+# model file location. UV_TORCH_BACKEND=cpu makes `uv pip install` resolve
+# torch's CPU-only wheel instead of the default CUDA-enabled one -- this
+# deployment has no GPU, so the CUDA build was pure import-time and
+# image-size overhead (probing for/loading NVIDIA shared libraries this
+# container will never use).
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
+    UV_TORCH_BACKEND=cpu \
     HF_HOME=/data/hf-cache \
     OPENMED_PROFILE=prod \
     PORT=8080
@@ -18,13 +30,34 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
 
+COPY --from=uv /uv /uvx /usr/local/bin/
+
 COPY requirements.txt .
-RUN pip install -r requirements.txt
+RUN uv pip install --system --no-cache -r requirements.txt
+
+# Bake OpenMed/privacy-filter-multilingual-v2 into the image. Deliberately
+# NOT going through openmed's own downloader (which would also invoke its
+# model-integrity check and require OPENMED_SKIP_MODEL_VERIFY at build
+# time) -- huggingface_hub.snapshot_download populates the exact same
+# on-disk HF cache layout under HF_HOME, so openmed finds it already
+# present and complete at runtime and skips downloading. This step sits
+# above COPY manage.py so app-code-only changes don't invalidate it and
+# force a ~2.8GB re-download; cloudbuild.yaml's registry cache is what
+# actually makes that cache hit persist across separate `gcloud builds
+# submit` invocations (a plain `docker build` has no cache between runs).
+#
+# --mount=type=secret keeps HF_TOKEN out of the image's layer history --
+# it's readable only for the duration of this RUN step.
+RUN --mount=type=secret,id=hf_token \
+    HF_TOKEN="$(cat /run/secrets/hf_token 2>/dev/null || true)" \
+    python -c "\
+import os; \
+from huggingface_hub import snapshot_download; \
+snapshot_download(repo_id='OpenMed/privacy-filter-multilingual-v2', token=os.environ.get('HF_TOKEN') or None)"
 
 COPY manage.py .
 
 RUN useradd --create-home --uid 10001 openmed \
-    && mkdir -p /data/hf-cache \
     && chown -R openmed:openmed /data /app
 
 USER openmed

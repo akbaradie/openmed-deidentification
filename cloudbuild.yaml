@@ -1,8 +1,37 @@
-# Used by scripts/deploy_cloud_run.sh. `gcloud builds submit --tag` alone
-# only looks for a Dockerfile at the build context root; ours lives at
-# docker/Dockerfile, so this spells out the build step explicitly instead.
+# Used by scripts/deploy_cloud_run.sh.
+#
+# Builds via buildx with registry-backed layer caching (--cache-from/
+# --cache-to against a stable :buildcache tag) so the baked-in model layer
+# in docker/Dockerfile (~2.8GB, downloaded from Hugging Face) is only
+# re-fetched on builds that actually change requirements.txt or that RUN
+# step -- not on every deploy. A plain `docker build` has zero cache
+# between separate `gcloud builds submit` invocations; this is what avoids
+# that.
+#
+# HF_TOKEN is pulled from Secret Manager (never passed as a plain
+# substitution/env var) and forwarded into the build as a BuildKit secret,
+# consumed by the RUN --mount=type=secret step in the Dockerfile -- it
+# never lands in an image layer or build log.
 steps:
   - name: gcr.io/cloud-builders/docker
-    args: ["build", "-f", "docker/Dockerfile", "-t", "$_IMAGE", "."]
-images:
-  - "$_IMAGE"
+    entrypoint: bash
+    secretEnv: ["HF_TOKEN"]
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        docker buildx create --driver docker-container --use --name openmed-builder 2>/dev/null || docker buildx use openmed-builder
+        docker buildx build \
+          -f docker/Dockerfile \
+          --secret id=hf_token,env=HF_TOKEN \
+          --cache-from=type=registry,ref=${_CACHE_IMAGE} \
+          --cache-to=type=registry,ref=${_CACHE_IMAGE},mode=max \
+          -t ${_IMAGE} \
+          --push \
+          .
+availableSecrets:
+  secretManager:
+    - versionName: projects/${PROJECT_ID}/secrets/openmed-hf-token/versions/latest
+      env: HF_TOKEN
+options:
+  logging: CLOUD_LOGGING_ONLY
