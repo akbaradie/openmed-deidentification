@@ -33,7 +33,22 @@ RUN apt-get update \
 COPY --from=uv /uv /uvx /usr/local/bin/
 
 COPY requirements.txt .
-RUN uv pip install --system --no-cache -r requirements.txt
+RUN uv pip install --system --no-cache -r requirements.txt \
+    # Precompile installed packages to .pyc at build time -- import-time
+    # source compilation is part of the ~20s import phase that dominates
+    # cold start (torch/transformers/openmed/fastapi). PYTHONDONTWRITEBYTECODE
+    # above stops Python from writing .pyc at runtime (the non-root `openmed`
+    # user wouldn't have permission to anyway) but doesn't stop it from
+    # reading ones already baked in here, at the mtimes they were compiled
+    # against -- safe since nothing touches these files again after this.
+    #
+    # `|| true`: compileall recurses into every .py file it finds, including
+    # ones our app never imports -- e.g. torch/testing/_internal ships a
+    # file using Python 3.12-only syntax (PEP 695 generics) that this
+    # image's Python 3.11 can't parse. Best-effort optimization, not a
+    # correctness requirement: a handful of unparseable, never-imported
+    # files shouldn't fail the whole build.
+    && (python -m compileall -q -j 0 /usr/local/lib/python3.11/site-packages || true)
 
 # Bake OpenMed/privacy-filter-multilingual-v2 into the image. Deliberately
 # NOT going through openmed's own downloader (which would also invoke its

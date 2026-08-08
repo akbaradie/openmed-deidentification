@@ -20,9 +20,12 @@ curl -fsS --max-time 10 "$BASE_URL/readyz" | tee /dev/stderr
 echo
 
 echo "== deidentify (model=$MODEL) =="
-# CPU-only inference on a 1.4B-param MoE model can take 40+ seconds for a
-# single short request -- this is not a hung connection, it's real compute
-# time. Budget accordingly; see the latency note in README.md.
+# If this is the first inference call since a cold start, budget 40-70s --
+# that's torch's one-time CPU init (thread pool, kernel selection), not
+# per-request cost. Steady-state (instance already warm) is single-digit
+# seconds. Not a hung connection either way; see the latency note in
+# README.md (corrected there after an early measurement mistook the
+# first-call cost for steady state).
 curl -fsS --max-time 180 -X POST "$BASE_URL/pii/deidentify" \
   -H "Content-Type: application/json" \
   -H "X-API-Key: $OPENMED_API_KEY" \

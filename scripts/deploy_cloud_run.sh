@@ -24,6 +24,25 @@
 # lookups at runtime. Must NOT be set during the build step -- the
 # snapshot_download in docker/Dockerfile needs the network.
 #
+# TRANSFORMERS_OFFLINE / HF_HUB_DISABLE_TELEMETRY / TOKENIZERS_PARALLELISM:
+# same spirit as HF_HUB_OFFLINE -- removing any remaining import-time
+# network calls or fork-safety warning/thread-pool spin-up during the
+# ~20s torch/transformers/openmed import phase, which measurement showed
+# is the actual dominant cost of cold start (not model file location).
+# Also runtime-only, same reasoning as HF_HUB_OFFLINE.
+#
+# OMP_NUM_THREADS=1 / MKL_NUM_THREADS=1: without these, torch's CPU
+# intra-op parallelism defaults to using every available core for a
+# SINGLE request's matrix ops -- with --cpu 2, one request already
+# monopolizes both cores, so a second concurrent request just contends
+# for the same threads instead of running in parallel. Confirmed
+# empirically: 1 request took 74s, 2 concurrent took 138s (should be
+# ~74s if truly parallel, ~148s if fully serial -- this was barely
+# better than serial). Pinning each request to 1 thread trades slower
+# single-request latency for genuine multi-request parallelism across
+# --cpu's cores. Not yet re-measured after this change -- confirm with
+# the same concurrent-vs-single comparison before trusting it.
+#
 # Auth: the app itself enforces X-API-Key (manage.py), so this deploys
 # with --allow-unauthenticated to match the VM's auth model exactly. Add
 # --no-allow-unauthenticated afterward if you also want Cloud Run IAM as a
@@ -80,6 +99,15 @@ set -euo pipefail
 : "${SERVICE_NAME:=openmed-deidentification}"
 : "${REPO_NAME:=openmed}"
 : "${MODEL:=OpenMed/privacy-filter-multilingual-v2}"
+# 1Gi/1 CPU was tried and confirmed broken: passes the initial startup
+# probe (model just barely fits at rest for one request) but OOM-kills
+# under any real concurrent load (2+ overlapping model-handle
+# constructions push memory past the limit) -- observed as a genuine
+# crash loop in Cloud Run logs (OOM -> Killed -> AUTOSCALING restart -> OOM
+# again). The weights alone are ~2.8GB at BF16; 4Gi is closer to the real
+# floor once torch/transformers/request overhead is included. Don't drop
+# below this without actually load-testing concurrent requests first, not
+# just a single startup probe.
 : "${MEMORY:=4Gi}"
 : "${CPU:=2}"
 : "${CONCURRENCY:=256}"
@@ -141,6 +169,11 @@ cat > "$FLAGS_FILE" <<EOF
   OPENMED_SKIP_MODEL_VERIFY: "1"
   OPENMED_SERVICE_TRUSTED_HOSTS: "${TRUSTED_HOSTS}"
   HF_HUB_OFFLINE: "1"
+  TRANSFORMERS_OFFLINE: "1"
+  HF_HUB_DISABLE_TELEMETRY: "1"
+  TOKENIZERS_PARALLELISM: "false"
+  OMP_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
 --set-secrets: OPENMED_API_KEY=openmed-api-key:latest
 EOF
 

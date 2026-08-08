@@ -26,7 +26,7 @@ Plus batch clients and throughput benchmarks for processing many documents.
 
 ```
 manage.py                openmed.service.app + the X-API-Key check -- this is what actually runs
-docker/Dockerfile           image: model baked in at build time, uv + CPU-only torch, non-root, single worker, $PORT-aware, healthcheck
+docker/Dockerfile           image: model baked in at build time, uv + CPU-only torch + bytecode precompiled, non-root, single worker, $PORT-aware, healthcheck
 docker/Caddyfile             VM-only: TLS termination + proxy (no auth logic -- app owns that)
 docker-compose.yml            openmed + Caddy, named volume for the HF cache (VM target)
 scripts/setup_gcp.sh           one-time: Artifact Registry, secrets, IAM, WIF trust for CI
@@ -164,42 +164,78 @@ stay cost-conscious, in the same spirit as `--cpu-throttling` below.
 
 **What actually moved the cold-start number, measured, not assumed:**
 
-| Change | Instance start → app ready |
+| Change | Instance start → app ready | Import phase alone |
+|---|---|---|
+| GCS-mounted model | 41.71s | ~24.6s |
+| Baked into image (CUDA `torch`, no other changes) | 41.71s — **no improvement** | ~27.6s |
+| + CPU-only `torch` (`uv`, `UV_TORCH_BACKEND=cpu`) + `--cpu-boost` | 31.62s (**-24%**) | ~20.3s |
+| + bytecode precompiled at build time + `TRANSFORMERS_OFFLINE`/`HF_HUB_DISABLE_TELEMETRY`/`TOKENIZERS_PARALLELISM` | **26.13s (-38% from baseline)** | ~15.9s |
+
+Two things worth taking away from this table, not just the final number.
+First: baking the model in and removing the GCS FUSE mount made *no
+measurable difference* on its own — the mount itself only took ~0.5s. The
+"import phase alone" column is where nearly every real gain actually
+came from (`torch`/`transformers`/`openmed`/`fastapi` import + app
+construction), never from where the model file lives. Second: `compileall`
+recurses into every `.py` file in every installed package, including ones
+your app never imports — `torch`'s own test-internals ship a file using
+Python 3.12-only syntax this image's Python 3.11 can't parse, which failed
+the build outright until wrapped in `|| true` (`docker/Dockerfile`
+comment has the detail). Precompilation is best-effort; don't let one
+unparseable, unused file block the whole thing.
+
+Don't assume the next plausible-sounding optimization helps without
+measuring it the same way (`gcloud logging read` on
+`resource.labels.revision_name`, diff "Starting new instance" against
+"Application startup complete" — or a phase-by-phase breakdown against
+the "MODEL INTEGRITY VERIFICATION DISABLED" / weight-loading-complete /
+"Application startup complete" log lines, which is what isolated the
+import phase as the dominant cost here in the first place).
+
+**Correction to an earlier claim in this README, found by actually testing
+it properly:** every single-request measurement up to this point (~44s,
+~74s) was timed as the *first* request after a fresh deploy — which
+includes `torch`'s one-time CPU init cost (thread pool spin-up, kernel
+selection, first-touch page faults bringing weight pages into RSS), not
+its steady-state per-request cost. Once warmed up with one throwaway
+request first:
+
+| | Time |
 |---|---|
-| GCS-mounted model | 41.71s |
-| Baked into image (CUDA `torch`, no other changes) | 41.71s — **no improvement** |
-| Baked in + CPU-only `torch` (`uv`, `UV_TORCH_BACKEND=cpu`) + `--cpu-boost` | **31.62s** |
+| First request after deploy (one-time `torch` init included) | ~44-74s |
+| Steady-state, same text repeated | ~1-2s |
+| Steady-state, genuinely novel text (rules out text-level caching) | ~4.2s |
+| 2 truly concurrent requests, same warm instance | ~4.75s |
 
-The first row-to-row comparison is important: baking the model in and
-removing the GCS FUSE mount made *no measurable difference* — the mount
-itself only took ~0.5s, and the ~25s dominant cost in every case is
-Python/`torch`/`transformers` import time, unrelated to where the model
-file lives. What actually helped was the CPU-only `torch` wheel (this
-deployment has no GPU, so the default CUDA-enabled wheel was spending
-import time loading NVIDIA shared libraries it would never use) plus
-Cloud Run's `--cpu-boost` (extra CPU specifically during the startup
-phase). ~24% faster, real and reproducible — but don't assume the next
-plausible-sounding optimization helps without measuring it the same way
-(`gcloud logging read` on `resource.labels.revision_name`, diff
-"Starting new instance" against "Application startup complete").
-
-**Inference latency is real and CPU-bound, separately from cold start.**
-A single short-text `/pii/deidentify` request took ~44 seconds end-to-end
-on `--cpu 2 --memory 4Gi` — this is a 1.4B-parameter MoE model running on
-CPU only, not a hung request. Practical implications:
-- Client timeouts need real headroom — 60s (this repo's original default)
-  isn't enough; `scripts/smoke_test.sh` now uses 180s.
-- `--concurrency 256` with `--max-instances 1` (this repo's current
-  defaults) raises how many requests Cloud Run will *queue* onto the one
-  instance, not how many run truly in parallel — 2 vCPUs doing ~40s of
-  CPU-bound work per request means real throughput is closer to one
-  request at a time, and anything beyond that queues with worse tail
-  latency. Not yet load-tested against these exact settings; confirm with
+So: real per-request latency on `--cpu 2 --memory 4Gi` is **single-digit
+seconds, not tens of seconds** — the earlier "~1 req/40s" throughput
+claim in this README was wrong, built on a cold-start measurement mistaken
+for steady state. Practical implications, corrected:
+- Client timeouts still need headroom for that first real request after
+  a cold start (`scripts/smoke_test.sh` uses 180s for exactly this
+  reason) — but budget single-digit seconds for every request after that,
+  not 40+.
+- Concurrency still doesn't scale cleanly: 2 concurrent requests (4.75s)
+  took meaningfully longer than 1 (1-4s), even after pinning `torch` to
+  1 thread per request (`OMP_NUM_THREADS=1`/`MKL_NUM_THREADS=1`, tried
+  specifically to let concurrent requests use separate cores) — with a
+  single Uvicorn worker sharing `--cpu 2`, concurrent CPU-bound requests
+  still contend rather than truly parallelize. `--concurrency 256` with
+  `--max-instances 1` (this repo's current defaults) queues requests onto
+  the one instance rather than running them in parallel. Not
+  systematically load-tested past 2 concurrent requests; confirm with
   `client/benchmark_rest.py --concurrency-levels ...` against the deployed
-  URL before assuming it holds up.
-- If real traffic needs better latency/throughput than this, look at
-  Cloud Run's GPU support (`--gpu`) or a smaller/quantized model before
-  scaling horizontally with more CPU-only instances.
+  URL before assuming a given concurrency level holds up.
+- If real traffic needs genuine concurrent throughput, look at Cloud
+  Run's GPU support (`--gpu`), more `--cpu`, or running multiple instances
+  (raise `--max-instances`) before assuming a single CPU-only instance
+  will parallelize CPU-bound inference on its own.
+
+Lesson embedded in this correction, not just the numbers: **always warm
+up before measuring latency that matters for a decision** — the original
+"~44s inference" claim shaped several downstream decisions in this
+README (client timeout defaults, throughput expectations) before being
+caught.
 
 `gcloud` flag names shift over time — this was written against the CLI's
 current behavior but hasn't been run end-to-end in this session; sanity
