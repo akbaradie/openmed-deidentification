@@ -1,0 +1,48 @@
+"""Thin auth shim around openmed's bundled FastAPI service.
+
+openmed.service.app has no built-in authentication (see
+https://openmed.life/docs/rest-service/). This module re-exports that exact
+app -- no endpoints reimplemented -- and adds one thing: every request must
+carry a matching X-API-Key header, except the platform health-check paths.
+Same enforcement on a VM (behind Caddy, which now only does TLS) and on
+Cloud Run (deployed directly, no reverse proxy needed), so auth behavior
+doesn't depend on where this runs.
+
+Entrypoint: `uvicorn manage:app`.
+"""
+
+from __future__ import annotations
+
+import hmac
+import os
+
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+
+from openmed.service.app import app
+
+_UNAUTHENTICATED_PATHS = {"/health", "/livez", "/readyz"}
+
+_API_KEY = os.environ.get("OPENMED_API_KEY", "")
+if not _API_KEY:
+    raise RuntimeError(
+        "OPENMED_API_KEY is not set. Refusing to start a PHI-handling "
+        "service without authentication -- set it in .env (VM) or as a "
+        "Cloud Run env var / secret before deploying."
+    )
+
+
+class ApiKeyMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        if request.url.path not in _UNAUTHENTICATED_PATHS:
+            provided = request.headers.get("x-api-key", "")
+            if not hmac.compare_digest(provided, _API_KEY):
+                return JSONResponse(
+                    {"error": {"code": "unauthorized", "message": "missing or invalid X-API-Key"}},
+                    status_code=401,
+                )
+        return await call_next(request)
+
+
+app.add_middleware(ApiKeyMiddleware)

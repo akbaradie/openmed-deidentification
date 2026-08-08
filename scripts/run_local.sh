@@ -14,6 +14,7 @@ fi
 
 export OPENMED_PROFILE="${OPENMED_PROFILE:-prod}"
 export OPENMED_SERVICE_PRELOAD_MODELS="${OPENMED_SERVICE_PRELOAD_MODELS:-OpenMed/privacy-filter-multilingual-v2}"
+: "${OPENMED_API_KEY:?Set OPENMED_API_KEY in .env -- manage.py refuses to start without it}"
 
 if [ ! -d .venv ]; then
   python3 -m venv .venv
@@ -27,4 +28,4 @@ HOST="${OPENMED_HOST:-127.0.0.1}"
 PORT="${OPENMED_PORT:-8080}"
 
 echo "Starting openmed service on ${HOST}:${PORT} (model=${OPENMED_SERVICE_PRELOAD_MODELS})"
-exec uvicorn openmed.service.app:app --host "$HOST" --port "$PORT"
+exec uvicorn manage:app --host "$HOST" --port "$PORT"

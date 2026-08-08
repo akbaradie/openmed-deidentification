@@ -22,6 +22,8 @@ services:
         limits:
           memory: 4g
 
+  # TLS-terminating reverse proxy for the VM target only. Not part of the
+  # auth story anymore (manage.py owns that) -- see docker/Caddyfile.
   proxy:
     image: caddy:2-alpine
     depends_on:
@@ -29,8 +31,6 @@ services:
         condition: service_healthy
     ports:
       - "127.0.0.1:8080:8080"
-    env_file:
-      - .env
     volumes:
       - ./docker/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data

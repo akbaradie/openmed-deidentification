@@ -1,0 +1,8 @@
+# Used by scripts/deploy_cloud_run.sh. `gcloud builds submit --tag` alone
+# only looks for a Dockerfile at the build context root; ours lives at
+# docker/Dockerfile, so this spells out the build step explicitly instead.
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args: ["build", "-f", "docker/Dockerfile", "-t", "$_IMAGE", "."]
+images:
+  - "$_IMAGE"

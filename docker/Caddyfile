@@ -1,19 +1,23 @@
-# Reverse proxy in front of the openmed service. openmed has no built-in
-# auth, so this enforces an API key and terminates TLS if you put a domain
-# on the site address below (Caddy auto-provisions Let's Encrypt certs).
+# TLS + reverse proxy in front of the openmed service, for the VM/
+# docker-compose deployment target only.
 #
+# Authentication is enforced by the app itself (see manage.py -- every
+# request needs a matching X-API-Key header, checked in-process), so
+# Caddy's only job here is terminating TLS and proxying through -- it no
+# longer duplicates the auth check.
+#
+# Cloud Run doesn't need this file at all: Cloud Run terminates TLS for you
+# at the platform edge, and the same app-level API key enforces auth there
+# too. Deploy the image directly -- see scripts/deploy_cloud_run.sh.
+
 # Local/HTTP-only default:
 :8080 {
-	@missing_key not header X-API-Key {$OPENMED_API_KEY}
-	respond @missing_key "unauthorized" 401
-
 	reverse_proxy openmed:8080
 }
 
-# For public TLS deployment, replace the block above with:
+# For public TLS on a VM, replace the block above with your domain --
+# Caddy auto-provisions and renews a Let's Encrypt certificate:
 #
 # your-domain.example.com {
-# 	@missing_key not header X-API-Key {$OPENMED_API_KEY}
-# 	respond @missing_key "unauthorized" 401
 # 	reverse_proxy openmed:8080
 # }
