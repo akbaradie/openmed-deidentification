@@ -3,10 +3,10 @@
 openmed.service.app has no built-in authentication (see
 https://openmed.life/docs/rest-service/). This module re-exports that exact
 app -- no endpoints reimplemented -- and adds one thing: every request must
-carry a matching X-API-Key header, except the platform health-check paths.
-Same enforcement on a VM (behind Caddy, which now only does TLS) and on
-Cloud Run (deployed directly, no reverse proxy needed), so auth behavior
-doesn't depend on where this runs.
+carry a matching X-API-Key header, except the platform health-check paths
+and the API documentation pages. Same enforcement on a VM (behind Caddy,
+which now only does TLS) and on Cloud Run (deployed directly, no reverse
+proxy needed), so auth behavior doesn't depend on where this runs.
 
 Entrypoint: `uvicorn manage:app`.
 """
@@ -22,7 +22,12 @@ from starlette.responses import JSONResponse
 
 from openmed.service.app import app
 
-_UNAUTHENTICATED_PATHS = {"/health", "/livez", "/readyz"}
+# /docs, /redoc, /openapi.json only expose the API's shape (endpoint names,
+# request/response schemas) -- no PHI, no data. Left open so the docs are
+# browsable without a key. The "Try it out" calls Swagger UI makes still go
+# through this same middleware like any other request, so they 401 without
+# a key regardless -- this only exempts *viewing* the schema.
+_UNAUTHENTICATED_PATHS = {"/health", "/livez", "/readyz", "/docs", "/redoc", "/openapi.json"}
 
 _API_KEY = os.environ.get("OPENMED_API_KEY", "")
 if not _API_KEY:

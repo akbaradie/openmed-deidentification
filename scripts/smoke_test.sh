@@ -20,7 +20,10 @@ curl -fsS --max-time 10 "$BASE_URL/readyz" | tee /dev/stderr
 echo
 
 echo "== deidentify (model=$MODEL) =="
-curl -fsS --max-time 60 -X POST "$BASE_URL/pii/deidentify" \
+# CPU-only inference on a 1.4B-param MoE model can take 40+ seconds for a
+# single short request -- this is not a hung connection, it's real compute
+# time. Budget accordingly; see the latency note in README.md.
+curl -fsS --max-time 180 -X POST "$BASE_URL/pii/deidentify" \
   -H "Content-Type: application/json" \
   -H "X-API-Key: $OPENMED_API_KEY" \
   -d "{\"text\": \"Patient Jordan Ramirez, MRN 4482910, called from 555-0147.\", \"method\": \"mask\", \"lang\": \"en\", \"model_name\": \"$MODEL\"}"

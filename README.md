@@ -88,6 +88,7 @@ run by hand or from CI.
 # once, by hand:
 export PROJECT_ID=your-gcp-project
 export OPENMED_API_KEY=...             # goes into Secret Manager, not GitHub
+export HF_TOKEN=...                    # free, read-scoped token from huggingface.co/settings/tokens -- see note below
 export GITHUB_REPO=you/openmed-deidentification   # for the WIF trust binding, see CI/CD below
 bash scripts/setup_gcp.sh
 
@@ -100,9 +101,15 @@ What `setup_gcp.sh` does once: creates the Artifact Registry repo, the GCS
 bucket mounted at `HF_HOME` (`/data/hf-cache`) via Cloud Run's native GCS
 FUSE volume mount so the model downloads once on the first cold start and
 every instance after — including new revisions — reads the cached weights
-instead of hitting Hugging Face again, stores `OPENMED_API_KEY` in Secret
-Manager, and sets up a Workload Identity Federation trust so GitHub Actions
-can deploy without a stored key (see CI/CD below).
+instead of hitting Hugging Face again, stores `OPENMED_API_KEY` and
+`HF_TOKEN` in Secret Manager, and sets up a Workload Identity Federation
+trust so GitHub Actions can deploy without a stored key (see CI/CD below).
+
+Why `HF_TOKEN` is required in practice, not just for gated models: openmed
+verifies the model's checksum via the Hugging Face Hub API before
+downloading it, and anonymous (unauthenticated) HF API calls share a much
+stricter rate limit than authenticated ones — Cloud Run's shared IP pool
+can trip that limit on a single deploy.
 
 What `deploy_cloud_run.sh` does every time: builds the image via Cloud
 Build (using `cloudbuild.yaml`, since `docker/Dockerfile` isn't at the
@@ -110,13 +117,34 @@ build context root), pushes to Artifact Registry, and deploys with
 `--no-cpu-throttling` (CPU stays allocated between requests, needed for the
 warm model pool and its idle-unload timers to behave correctly) and
 `--allow-unauthenticated` (Cloud Run's own IAM gate is off; the app-level
-`X-API-Key` check is what protects it, same as the VM).
+`X-API-Key` check is what protects it, same as the VM). It also sets
+`OPENMED_SKIP_MODEL_VERIFY=1` — see the comment block at the top of the
+script for why: `openmed 2.0.0`'s bundled integrity check hashes the HF
+repo's *commit metadata*, not the model weights, so it false-positives on
+any trivial commit (confirmed for this exact model: the weights haven't
+changed since upload, only a README got edited after the package's
+manifest was frozen). Revisit this once openmed ships a fix.
 
 Cold starts still happen whenever an instance scales up from zero — this
 avoids re-downloading the model on each one, not the in-memory load into the
 process itself. If you need zero cold starts entirely, set
 `MIN_INSTANCES=1` before running `deploy_cloud_run.sh` (an always-on
 instance costs more but skips scale-from-zero altogether).
+
+**Inference latency is real and CPU-bound.** A single short-text
+`/pii/deidentify` request took ~44 seconds end-to-end on the default
+`--cpu 2 --memory 4Gi` config in testing — this is a 1.4B-parameter MoE
+model running on CPU only, not a hung request. Practical implications:
+- Client timeouts need real headroom — 60s (this repo's original default)
+  isn't enough; `scripts/smoke_test.sh` now uses 180s.
+- Per-instance throughput is low (`--concurrency 8` doesn't help much if
+  each request occupies CPU for ~40s) — expect roughly one request at a
+  time in practice per instance, closer to 1 req/40s than 8 concurrent.
+- If real traffic needs better latency/throughput than this, look at
+  Cloud Run's GPU support (`--gpu`) or a smaller/quantized model before
+  scaling horizontally with more CPU-only instances — this wasn't
+  benchmarked here, just flagging it as the next thing to measure with
+  `client/benchmark_rest.py` against the deployed URL.
 
 `gcloud` flag names shift over time — this was written against the CLI's
 current behavior but hasn't been run end-to-end in this session; sanity

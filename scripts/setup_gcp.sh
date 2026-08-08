@@ -8,10 +8,17 @@
 # Creates:
 #   - Artifact Registry repo for the built image
 #   - GCS bucket mounted at HF_HOME on Cloud Run (see deploy_cloud_run.sh)
-#   - Secret Manager secret holding OPENMED_API_KEY
-#   - A dedicated deployer service account with just the roles it needs
-#   - A Workload Identity Pool + OIDC provider trusting GitHub Actions,
-#     scoped to one specific "owner/repo" -- no long-lived key leaves GCP
+#   - Secret Manager secrets holding OPENMED_API_KEY and HF_TOKEN (the
+#     latter is required in practice, not just for gated models -- openmed
+#     verifies checksums via the HF Hub API before downloading, and
+#     anonymous API calls hit a much stricter rate limit that Cloud Run's
+#     shared IP pool can trip on a single deploy)
+#   - If SETUP_WIF=true (default): a dedicated deployer service account +
+#     a Workload Identity Pool/OIDC provider trusting GitHub Actions,
+#     scoped to one specific "owner/repo" -- for the .github/workflows/
+#     deploy.yml path. Set SETUP_WIF=false if you're instead using Cloud
+#     Run's own "Deploy continuously" / Developer Connect integration,
+#     which authenticates itself and doesn't need any of this.
 #
 # NOTE: gcloud flags shift over time and none of this has been run
 # end-to-end in this session -- sanity-check against current `gcloud`
@@ -23,7 +30,11 @@ set -euo pipefail
 : "${REPO_NAME:=openmed}"
 : "${BUCKET_NAME:=${PROJECT_ID}-openmed-hf-cache}"
 : "${OPENMED_API_KEY:?Set OPENMED_API_KEY -- stored in Secret Manager, never in GitHub}"
-: "${GITHUB_REPO:?Set GITHUB_REPO as owner/repo, e.g. akbaradie/openmed-deidentification}"
+: "${HF_TOKEN:?Set HF_TOKEN -- a free read-scoped token from https://huggingface.co/settings/tokens, stored in Secret Manager}"
+: "${SETUP_WIF:=true}"
+if [ "$SETUP_WIF" = "true" ]; then
+  : "${GITHUB_REPO:?Set GITHUB_REPO as owner/repo, e.g. akbaradie/openmed-deidentification (or set SETUP_WIF=false if using Developer Connect instead)}"
+fi
 : "${DEPLOYER_SA_NAME:=github-actions-deployer}"
 : "${WIF_POOL_ID:=github-pool}"
 : "${WIF_PROVIDER_ID:=github-provider}"
@@ -47,11 +58,46 @@ echo ">> Ensuring HF cache bucket exists..."
 gcloud storage buckets describe "gs://${BUCKET_NAME}" >/dev/null 2>&1 || \
   gcloud storage buckets create "gs://${BUCKET_NAME}" --location="$REGION" --uniform-bucket-level-access --project="$PROJECT_ID"
 
-echo ">> Storing OPENMED_API_KEY in Secret Manager..."
+echo ">> Storing OPENMED_API_KEY and HF_TOKEN in Secret Manager..."
 if gcloud secrets describe openmed-api-key --project="$PROJECT_ID" >/dev/null 2>&1; then
   printf '%s' "$OPENMED_API_KEY" | gcloud secrets versions add openmed-api-key --project="$PROJECT_ID" --data-file=-
 else
   printf '%s' "$OPENMED_API_KEY" | gcloud secrets create openmed-api-key --project="$PROJECT_ID" --data-file=- --replication-policy=automatic
+fi
+if gcloud secrets describe openmed-hf-token --project="$PROJECT_ID" >/dev/null 2>&1; then
+  printf '%s' "$HF_TOKEN" | gcloud secrets versions add openmed-hf-token --project="$PROJECT_ID" --data-file=-
+else
+  printf '%s' "$HF_TOKEN" | gcloud secrets create openmed-hf-token --project="$PROJECT_ID" --data-file=- --replication-policy=automatic
+fi
+
+# The *deployer* identity (above/below, WIF or your own gcloud auth) is who
+# runs `gcloud run deploy` -- that's different from the identity Cloud Run
+# actually runs the *container* as at runtime, which needs its own grant to
+# read these secrets via --set-secrets. Defaults to the project's default
+# compute service account unless deploy_cloud_run.sh is changed to pass
+# --service-account with a dedicated runtime identity.
+: "${RUNTIME_SA:=$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')-compute@developer.gserviceaccount.com}"
+echo ">> Granting the Cloud Run runtime service account (${RUNTIME_SA}) access to both secrets..."
+for SECRET_NAME in openmed-api-key openmed-hf-token; do
+  gcloud secrets add-iam-policy-binding "$SECRET_NAME" \
+    --project="$PROJECT_ID" \
+    --member="serviceAccount:${RUNTIME_SA}" \
+    --role="roles/secretmanager.secretAccessor" \
+    >/dev/null
+done
+
+if [ "$SETUP_WIF" != "true" ]; then
+  cat <<EOF
+
+>> Done (SETUP_WIF=false -- skipped the deployer service account and
+   Workload Identity Federation setup). Artifact Registry repo, HF cache
+   bucket, and the openmed-api-key secret are ready.
+
+   If you're using Cloud Run's "Deploy continuously" / Developer Connect
+   integration, finish that in the Cloud Run console -- it handles its own
+   GitHub auth and doesn't need anything below this point.
+EOF
+  exit 0
 fi
 
 echo ">> Ensuring deployer service account exists..."
