@@ -1,0 +1,41 @@
+services:
+  openmed:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: openmed-deidentification:local
+    env_file:
+      - .env
+    expose:
+      - "8080"
+    volumes:
+      - hf-cache:/data/hf-cache
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/readyz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 4g
+
+  proxy:
+    image: caddy:2-alpine
+    depends_on:
+      openmed:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8080:8080"
+    env_file:
+      - .env
+    volumes:
+      - ./docker/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+    restart: unless-stopped
+
+volumes:
+  hf-cache:
+  caddy-data:

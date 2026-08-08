@@ -1,0 +1,2 @@
+openmed[hf,service]>=0.1
+httpx>=0.27

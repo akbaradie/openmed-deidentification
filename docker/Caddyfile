@@ -1,0 +1,19 @@
+# Reverse proxy in front of the openmed service. openmed has no built-in
+# auth, so this enforces an API key and terminates TLS if you put a domain
+# on the site address below (Caddy auto-provisions Let's Encrypt certs).
+#
+# Local/HTTP-only default:
+:8080 {
+	@missing_key not header X-API-Key {$OPENMED_API_KEY}
+	respond @missing_key "unauthorized" 401
+
+	reverse_proxy openmed:8080
+}
+
+# For public TLS deployment, replace the block above with:
+#
+# your-domain.example.com {
+# 	@missing_key not header X-API-Key {$OPENMED_API_KEY}
+# 	respond @missing_key "unauthorized" 401
+# 	reverse_proxy openmed:8080
+# }
